@@ -29,8 +29,10 @@
 
 #include <tbb/parallel_for.h>
 
+#include <array>
 #include <functional>
 #include <type_traits>
+#include <vector>
 
 namespace openvdb {
 OPENVDB_USE_VERSION_NAMESPACE
@@ -47,6 +49,137 @@ enum class TrimMode {
     kInterior, ///< Set out-of-band interior voxels to the background value
     kExterior, ///< Set out-of-band exterior voxels to the background value
     kAll       ///< Set all out-of-band voxels to the background value
+};
+
+/// @brief Drop-in replacement for math::NineteenPointStencil in the tracker and advection
+/// kernels. Gathers the 19-point star from the current leaf buffer and its six
+/// face-neighbor buffers instead of performing 18 ValueAccessor lookups.
+/// Reads exactly the same values, so results are bitwise identical.
+/// @note setLeaf() must be called for each leaf before moveTo() on its voxels.
+template<typename GridT>
+class LeafStarStencil
+{
+public:
+    using GridType = GridT;
+    using TreeType = typename GridT::TreeType;
+    using ValueType = typename GridT::ValueType;
+    using LeafType = typename TreeType::LeafNodeType;
+    static const int SIZE = 19;
+
+    /// The six tile proxy buffers live on the heap (one allocation per stencil), so the
+    /// stencil's stack footprint does not grow with the leaf size.
+    explicit LeafStarStencil(const GridT& grid)
+        : mAcc(grid.tree()), mTile(6 * LeafType::SIZE) {}
+
+    /// Not copyable: mBuf points into this stencil's own mTile, so a copy made after setLeaf()
+    /// would read the source's tile buffers.
+    LeafStarStencil(const LeafStarStencil&) = delete;
+    LeafStarStencil& operator=(const LeafStarStencil&) = delete;
+
+    /// Cache the buffers of @a leaf and its face neighbors. A neighbor that is
+    /// not a leaf lies inside a tile, so it is replaced by a constant proxy buffer.
+    void setLeaf(const LeafType& leaf)
+    {
+        const int dim = int(LeafType::DIM);
+        const Coord& o = leaf.origin();
+        mBuf[0] = leaf.buffer().data();
+        for (int n = 0; n < 6; ++n) {
+            const int axis = n >> 1, offset = (n & 1) ? dim : -dim;
+            const Coord p = o.offsetBy(axis == 0 ? offset : 0, axis == 1 ? offset : 0,
+                                       axis == 2 ? offset : 0);
+            if (const LeafType* neighbor = mAcc.probeConstLeaf(p)) {
+                mBuf[n + 1] = neighbor->buffer().data();
+            } else {
+                ValueType* tile = mTile.data() + n * LeafType::SIZE;
+                std::fill(tile, tile + LeafType::SIZE, mAcc.getValue(p));
+                mBuf[n + 1] = tile;
+            }
+        }
+    }
+
+    template<typename IterT>
+    void moveTo(const IterT& iter) { this->gather(iter.getCoord(), iter.pos(), *iter); }
+
+    void moveTo(const Coord& ijk, const ValueType& centerValue)
+    {
+        this->gather(ijk, LeafType::coordToOffset(ijk), centerValue);
+    }
+
+    const ValueType& getValue(unsigned pos = 0) const { return mValues[pos]; }
+
+    template<int i, int j, int k>
+    const ValueType& getValue() const { return mValues[pos<i, j, k>()]; }
+
+    /// Same layout as math::NineteenPointStencil (NineteenPt<i,j,k>::idx):
+    /// slot = (|d|-1)*6 + (d > 0 ? 1 : 4) + axis, center at 0.
+    template<int i, int j, int k>
+    static constexpr unsigned pos()
+    {
+        static_assert(((i != 0) + (j != 0) + (k != 0)) <= 1 && i*i <= 9 && j*j <= 9 && k*k <= 9,
+            "LeafStarStencil only supports axis-aligned offsets up to 3");
+        return i != 0 ? slot(0, i) : j != 0 ? slot(1, j) : k != 0 ? slot(2, k) : 0u;
+    }
+
+    const Coord& getCenterCoord() const { return mCenter; }
+
+private:
+    static constexpr unsigned slot(int axis, int d)
+    {
+        return unsigned(((d < 0 ? -d : d) - 1) * 6 + (d > 0 ? 1 : 4) + axis);
+    }
+
+    void gather(const Coord& ijk, Index n, const ValueType& centerValue)
+    {
+        const Index L = LeafType::LOG2DIM, M = LeafType::DIM - 1;
+        const int x = int(n >> 2*L), y = int((n >> L) & M), z = int(n & M);
+        const Index yz = n & ((Index(1) << 2*L) - 1), xz = n & ~(M << L), xy = n & ~M;
+        mCenter = ijk;
+        mValues[0] = centerValue;
+        for (int d = -3; d <= 3; ++d) {
+            if (d == 0) continue;
+            int t = x + d;
+            mValues[slot(0, d)] =
+                mBuf[t < 0 ? 1 : (t > int(M) ? 2 : 0)][(Index(t & int(M)) << 2*L) | yz];
+            t = y + d;
+            mValues[slot(1, d)] =
+                mBuf[t < 0 ? 3 : (t > int(M) ? 4 : 0)][(Index(t & int(M)) << L) | xz];
+            t = z + d;
+            mValues[slot(2, d)] = mBuf[t < 0 ? 5 : (t > int(M) ? 6 : 0)][Index(t & int(M)) | xy];
+        }
+    }
+
+    tree::ValueAccessor<const TreeType> mAcc;
+    const ValueType* mBuf[7];
+    std::vector<ValueType> mTile;
+    std::array<ValueType, SIZE> mValues;
+    Coord mCenter;
+};
+
+/// True if the leaf-local stencil and the batched kernels built on it may replace
+/// math::NineteenPointStencil for @c GridT: leaves must be at least 4 voxels wide, so the
+/// +-3 offsets never reach past the face neighbors.
+template<typename GridT>
+struct UseLeafStarStencil
+{
+    static constexpr bool value = GridT::TreeType::LeafNodeType::DIM >= 4;
+};
+
+/// Selects LeafStarStencil in place of math::NineteenPointStencil (the WENO5/HJWENO5
+/// scheme stencil) where UseLeafStarStencil allows it; everything else passes through.
+template<typename GridT, typename StencilT, bool = UseLeafStarStencil<GridT>::value>
+struct LeafStencil
+{
+    using Type = StencilT;
+    static constexpr bool LeafLocal = false;
+    template<typename LeafT> static void setLeaf(Type&, const LeafT&) {}
+};
+
+template<typename GridT>
+struct LeafStencil<GridT, math::NineteenPointStencil<GridT>, true>
+{
+    using Type = LeafStarStencil<GridT>;
+    static constexpr bool LeafLocal = true;
+    template<typename LeafT> static void setLeaf(Type& s, const LeafT& leaf) { s.setLeaf(leaf); }
 };
 
 } // namespace lstrack
@@ -213,7 +346,9 @@ private:
     struct Normalizer
     {
         using SchemeT = math::BIAS_SCHEME<SpatialScheme>;
-        using StencilT = typename SchemeT::template ISStencil<GridType>::StencilType;
+        using LeafStencilT = lstrack::LeafStencil<GridType,
+            typename SchemeT::template ISStencil<GridType>::StencilType>;
+        using StencilT = typename LeafStencilT::Type;
         using MaskLeafT = typename MaskT::LeafNodeType;
         using MaskIterT = typename MaskLeafT::ValueOnCIter;
         using VoxelIterT = typename LeafType::ValueOnCIter;
@@ -657,6 +792,7 @@ euler(const LeafRange& range, Index phiBuffer, Index resultBuffer)
     StencilT stencil(mTracker.grid());
 
     for (typename LeafRange::Iterator leafIter = range.begin(); leafIter; ++leafIter) {
+        LeafStencilT::setLeaf(stencil, *leafIter);
         const ValueType* phi = leafIter.buffer(phiBuffer).data();
         ValueType* result = leafIter.buffer(resultBuffer).data();
         if (mMask == nullptr) {
