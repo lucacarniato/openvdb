@@ -111,22 +111,31 @@ public:
     template<int i, int j, int k>
     const ValueType& getValue() const { return mValues[pos<i, j, k>()]; }
 
-    /// Same layout as math::NineteenPointStencil (NineteenPt<i,j,k>::idx): the center at 0,
-    /// then six slots per distance 1, 2, 3, in the order +x, +y, +z, -x, -y, -z.
+    /// Index of the voxel at offset (i, j, k) from the center, e.g. pos<0, -2, 0>().
     template<int i, int j, int k>
     static constexpr unsigned pos()
     {
-        static_assert(((i != 0) + (j != 0) + (k != 0)) <= 1 && i*i <= 9 && j*j <= 9 && k*k <= 9,
-            "LeafStarStencil only supports axis-aligned offsets up to 3");
-        return i != 0 ? slot(0, i) : j != 0 ? slot(1, j) : k != 0 ? slot(2, k) : 0u;
+        static_assert((i != 0) + (j != 0) + (k != 0) <= 1,
+            "LeafStarStencil: the offset must lie on a single axis");
+        static_assert(-3 <= i && i <= 3 && -3 <= j && j <= 3 && -3 <= k && k <= 3,
+            "LeafStarStencil: the offset must be at most 3");
+        if (i != 0) return slot(0, i);
+        if (j != 0) return slot(1, j);
+        if (k != 0) return slot(2, k);
+        return 0; // the center
     }
 
     const Coord& getCenterCoord() const { return mCenter; }
 
 private:
+    /// Index in mValues of the neighbor at signed distance @a d (-3 to 3, not 0) along
+    /// @a axis (0 = x, 1 = y, 2 = z). Same layout as math::NineteenPointStencil: the center
+    /// at 0, then six slots for each distance 1, 2, 3, in the order +x, +y, +z, -x, -y, -z.
     static constexpr unsigned slot(int axis, int d)
     {
-        return unsigned(((d < 0 ? -d : d) - 1) * 6 + (d > 0 ? 1 : 4) + axis);
+        const int distance = d > 0 ? d : -d;
+        const int direction = d > 0 ? axis : axis + 3; // 0 to 5 for +x, +y, +z, -x, -y, -z
+        return unsigned(1 + 6 * (distance - 1) + direction);
     }
 
     /// Read the 18 neighbors of the voxel at linear offset @a n in the current leaf.
