@@ -51,12 +51,13 @@ enum class TrimMode {
     kAll       ///< Set all out-of-band voxels to the background value
 };
 
-/// @brief Drop-in replacement for math::NineteenPointStencil in the tracker and advection
-/// kernels. Gathers the 19-point star from the current leaf buffer and its six
-/// face-neighbor buffers instead of performing 18 ValueAccessor lookups.
-/// Reads exactly the same values, so results are bitwise identical.
+/// @brief Drop-in replacement for the axis-aligned star stencils in the tracker and advection
+/// kernels: math::SevenPointStencil (@a Radius 1), math::ThirteenPointStencil (@a Radius 2)
+/// and math::NineteenPointStencil (@a Radius 3). Gathers the star from the current leaf
+/// buffer and its six face-neighbor buffers instead of performing 6 * Radius
+/// ValueAccessor lookups. Reads exactly the same values, so results are bitwise identical.
 /// @note setLeaf() must be called for each leaf before moveTo() on its voxels.
-template<typename GridT>
+template<typename GridT, int Radius = 3>
 class LeafStarStencil
 {
 public:
@@ -64,7 +65,7 @@ public:
     using TreeType = typename GridT::TreeType;
     using ValueType = typename GridT::ValueType;
     using LeafType = typename TreeType::LeafNodeType;
-    static const int SIZE = 19;
+    static const int SIZE = 1 + 6 * Radius;
 
     /// The six tile proxy buffers live on the heap (one allocation per stencil), so the
     /// stencil's stack footprint does not grow with the leaf size.
@@ -117,8 +118,8 @@ public:
     {
         static_assert((i != 0) + (j != 0) + (k != 0) <= 1,
             "LeafStarStencil: the offset must lie on a single axis");
-        static_assert(-3 <= i && i <= 3 && -3 <= j && j <= 3 && -3 <= k && k <= 3,
-            "LeafStarStencil: the offset must be at most 3");
+        static_assert(-Radius <= i && i <= Radius && -Radius <= j && j <= Radius
+            && -Radius <= k && k <= Radius, "LeafStarStencil: the offset must be at most Radius");
         if (i != 0) return slot(0, i);
         if (j != 0) return slot(1, j);
         if (k != 0) return slot(2, k);
@@ -128,9 +129,10 @@ public:
     const Coord& getCenterCoord() const { return mCenter; }
 
 private:
-    /// Index in mValues of the neighbor at signed distance @a d (-3 to 3, not 0) along
-    /// @a axis (0 = x, 1 = y, 2 = z). Same layout as math::NineteenPointStencil: the center
-    /// at 0, then six slots for each distance 1, 2, 3, in the order +x, +y, +z, -x, -y, -z.
+    /// Index in mValues of the neighbor at signed distance @a d (-Radius to Radius, not 0)
+    /// along @a axis (0 = x, 1 = y, 2 = z). Same layout as the math:: star stencils: the
+    /// center at 0, then six slots for each distance 1 to Radius, in the order
+    /// +x, +y, +z, -x, -y, -z.
     static constexpr unsigned slot(int axis, int d)
     {
         const int distance = d > 0 ? d : -d;
@@ -149,7 +151,7 @@ private:
         mCenter = ijk;
         mValues[0] = centerValue;
         for (int axis = 0; axis < 3; ++axis) {
-            for (int d = -3; d <= 3; ++d) {
+            for (int d = -Radius; d <= Radius; ++d) {
                 if (d == 0) continue;
                 const int t = local[axis] + d; // neighbor coordinate along this axis
                 int buffer = 0, shift = d;    // the current leaf
@@ -172,17 +174,18 @@ private:
     Coord mCenter;
 };
 
-/// True if the leaf-local stencil and the batched kernels built on it may replace
-/// math::NineteenPointStencil for @c GridT: leaves must be at least 4 voxels wide, so the
-/// +-3 offsets never reach past the face neighbors.
+/// True if the leaf-local stencil may replace the math:: star stencils for @c GridT:
+/// leaves must be at least 4 voxels wide, so the +-3 offsets never reach past the face
+/// neighbors.
 template<typename GridT>
 struct UseLeafStarStencil
 {
     static constexpr bool value = GridT::TreeType::LeafNodeType::DIM >= 4;
 };
 
-/// Selects LeafStarStencil in place of math::NineteenPointStencil (the WENO5/HJWENO5
-/// scheme stencil) where UseLeafStarStencil allows it; everything else passes through.
+/// Selects LeafStarStencil in place of math::SevenPointStencil (FIRST_BIAS),
+/// math::ThirteenPointStencil (SECOND_BIAS) and math::NineteenPointStencil (THIRD_BIAS,
+/// WENO5_BIAS, HJWENO5_BIAS) where UseLeafStarStencil allows it; everything else passes through.
 template<typename GridT, typename StencilT, bool = UseLeafStarStencil<GridT>::value>
 struct LeafStencil
 {
@@ -190,12 +193,24 @@ struct LeafStencil
     template<typename LeafT> static void setLeaf(Type&, const LeafT&) {}
 };
 
-template<typename GridT>
-struct LeafStencil<GridT, math::NineteenPointStencil<GridT>, true>
+template<typename GridT, int Radius>
+struct LeafStarStencilSelector
 {
-    using Type = LeafStarStencil<GridT>;
+    using Type = LeafStarStencil<GridT, Radius>;
     template<typename LeafT> static void setLeaf(Type& s, const LeafT& leaf) { s.setLeaf(leaf); }
 };
+
+template<typename GridT>
+struct LeafStencil<GridT, math::SevenPointStencil<GridT>, true>
+    : LeafStarStencilSelector<GridT, 1> {};
+
+template<typename GridT>
+struct LeafStencil<GridT, math::ThirteenPointStencil<GridT>, true>
+    : LeafStarStencilSelector<GridT, 2> {};
+
+template<typename GridT>
+struct LeafStencil<GridT, math::NineteenPointStencil<GridT>, true>
+    : LeafStarStencilSelector<GridT, 3> {};
 
 } // namespace lstrack
 
