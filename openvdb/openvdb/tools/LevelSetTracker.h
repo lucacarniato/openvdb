@@ -54,6 +54,12 @@ enum class TrimMode {
 
 namespace internal {
 
+/// @brief The stars of a run of @a Width consecutive voxels along z, as read by
+/// LeafStarStencil::gatherRun(): element [axis][Radius + d][i] is the value at distance @c d
+/// along @c axis from voxel @c i of the run.
+template<typename T, int Radius, std::size_t Width>
+using RunStars = std::array<std::array<std::array<T, Width>, 2 * Radius + 1>, 3>;
+
 /// @brief Replaces an axis-aligned math:: star stencil in the tracker and advection kernels.
 ///
 /// @details Reads the star from the current leaf and its six face neighbors, whose buffers
@@ -134,6 +140,37 @@ public:
     /// Return the coordinates of the voxel at the center of the star.
     const Coord& getCenterCoord() const { return mCenter; }
 
+    /// @brief Read the stars of @a Width consecutive voxels along z of the current leaf.
+    /// @details values[axis][Radius + d][i] is the value at distance @c d along @c axis from
+    /// voxel @a n0 + i, which is the value that moveTo() reads for that voxel. The voxels of a
+    /// run have contiguous offsets, so each row of @a values is read with contiguous loads and
+    /// a kernel can process the voxels of a run together.
+    /// @param n0      the linear offset of the first voxel of the run, a multiple of @a Width
+    /// @param values  the output, indexed by axis, distance + Radius and voxel
+    template<int Width>
+    void gatherRun(Index n0, RunStars<ValueType, Radius, Width>& values) const
+    {
+        static_assert(LeafType::DIM % Width == 0,
+            "LeafStarStencil: Width must divide the leaf width");
+        const Coord local = LeafType::offsetToLocalCoord(n0);
+
+        // Along x and y, the values at one distance from the run are a run of the same buffer.
+        for (int axis = 0; axis < 2; ++axis) {
+            for (int d = -Radius; d <= Radius; ++d) {
+                const ValueType* row = this->neighbor(local, n0, axis, d);
+                for (int i = 0; i < Width; ++i) values[axis][Radius + d][i] = row[i];
+            }
+        }
+        // Along z, read the run and Radius values on either side once, then shift.
+        std::array<ValueType, Width + 2 * Radius> row;
+        for (int j = 0; j < Width + 2 * Radius; ++j) {
+            row[j] = *this->neighbor(local, n0, 2, j - Radius);
+        }
+        for (int d = -Radius; d <= Radius; ++d) {
+            for (int i = 0; i < Width; ++i) values[2][Radius + d][i] = row[Radius + d + i];
+        }
+    }
+
 private:
     static const int SIZE = 1 + 6 * Radius;
 
@@ -164,34 +201,44 @@ private:
         return unsigned(1 + 6 * (distance - 1) + direction);
     }
 
+    /// @brief Return the address of the value at distance @a d along @a axis from a voxel of
+    /// the current leaf.
+    /// @details A value outside the leaf is read from the face neighbor on that side, at the
+    /// same position shifted by one leaf width.
+    /// @param local  the coordinates of the voxel within the leaf
+    /// @param n      the linear offset of the voxel in the leaf
+    /// @param axis   0 for x, 1 for y, 2 for z
+    /// @param d      the signed distance, at most one leaf width from the leaf
+    const ValueType* neighbor(const Coord& local, Index n, int axis, int d) const
+    {
+        const int dim = int(LeafType::DIM);
+        const std::array<int, 3> stride = {{ dim * dim, dim, 1 }}; // offset step along x, y, z
+        const int t = local[axis] + d; // neighbor coordinate along this axis
+        int buffer = 0, shift = d;     // the current leaf
+
+        if (t < 0) {
+            buffer = 1 + 2 * axis;     // the neighbor on the negative side
+            shift += dim;
+        } else if (t >= dim) {
+            buffer = 2 + 2 * axis;     // the neighbor on the positive side
+            shift -= dim;
+        }
+        return mBuf[buffer] + (int(n) + shift * stride[axis]);
+    }
+
     /// @brief Read the 6 * Radius neighbors of a voxel of the current leaf into mValues.
-    /// @details A neighbor outside the leaf is read from the face neighbor on that side, at
-    /// the same position shifted by one leaf width.
     /// @param ijk          the coordinates of the voxel
     /// @param n            the linear offset of the voxel in the leaf
     /// @param centerValue  the value to store for the center of the star
     void gather(const Coord& ijk, Index n, const ValueType& centerValue)
     {
-        const int dim = int(LeafType::DIM);
-        const std::array<int, 3> stride = {{ dim * dim, dim, 1 }}; // offset step along x, y, z
         const Coord local = LeafType::offsetToLocalCoord(n);
 
         mCenter = ijk;
         mValues[0] = centerValue;
         for (int axis = 0; axis < 3; ++axis) {
             for (int d = -Radius; d <= Radius; ++d) {
-                if (d == 0) continue;
-                const int t = local[axis] + d; // neighbor coordinate along this axis
-                int buffer = 0, shift = d;     // the current leaf
-
-                if (t < 0) {
-                    buffer = 1 + 2 * axis;     // the neighbor on the negative side
-                    shift += dim;
-                } else if (t >= dim) {
-                    buffer = 2 + 2 * axis;     // the neighbor on the positive side
-                    shift -= dim;
-                }
-                mValues[slot(axis, d)] = mBuf[buffer][int(n) + shift * stride[axis]];
+                if (d != 0) mValues[slot(axis, d)] = *this->neighbor(local, n, axis, d);
             }
         }
     }
@@ -235,6 +282,103 @@ struct LeafStencil<GridT, math::ThirteenPointStencil<GridT>, true>
 template<typename GridT>
 struct LeafStencil<GridT, math::NineteenPointStencil<GridT>, true>
     : LeafStarStencilSelector<GridT, 3> {};
+
+/// @brief The number of consecutive voxels along z that the run kernels process together:
+/// 8, or the leaf width for narrower leaves.
+template<typename LeafT>
+struct RunWidth
+{
+    static constexpr int value = LeafT::DIM < 8 ? int(LeafT::DIM) : 8;
+};
+
+/// @brief Call @a op(n0, active) for each run of @a Width consecutive voxels of @a leaf that
+/// has at least one active voxel.
+/// @details @c n0 is the linear offset of the first voxel of the run, and bit @c i of
+/// @c active is set if voxel @c n0 + @c i is active.
+template<int Width, typename LeafT, typename OpT>
+inline void forEachActiveRun(const LeafT& leaf, const OpT& op)
+{
+    static_assert(64 % Width == 0, "a run must not straddle two words of the value mask");
+    const auto& mask = leaf.getValueMask();
+    const Index64 runBits = (Index64(1) << Width) - 1;
+
+    for (Index w = 0; w < LeafT::NodeMaskType::WORD_COUNT; ++w) {
+        const Index64 word = mask.template getWord<Index64>(w);
+        if (word == 0) continue;
+        for (Index r = 0; r < 64; r += Width) {
+            const unsigned active = unsigned((word >> r) & runBits);
+            if (active != 0) op(w * 64 + r, active);
+        }
+    }
+}
+
+/// @brief math::GodunovsNormSqrd, evaluating both the outside and the inside case and then
+/// selecting one, so that the compiler can vectorize it across voxels.
+/// @details Each case performs the same operations as in math::GodunovsNormSqrd, so the
+/// result is the same.
+template<typename T>
+inline T godunovsNormSqrdSelect(bool isOutside,
+                                T dP_xm, T dP_xp, T dP_ym, T dP_yp, T dP_zm, T dP_zp)
+{
+    using math::Max;
+    using math::Min;
+    using math::Pow2;
+
+    const T zero(0);
+    T outside = Max(Pow2(Max(dP_xm, zero)), Pow2(Min(dP_xp, zero)));
+    outside  += Max(Pow2(Max(dP_ym, zero)), Pow2(Min(dP_yp, zero)));
+    outside  += Max(Pow2(Max(dP_zm, zero)), Pow2(Min(dP_zp, zero)));
+    T inside  = Max(Pow2(Min(dP_xm, zero)), Pow2(Max(dP_xp, zero)));
+    inside   += Max(Pow2(Min(dP_ym, zero)), Pow2(Max(dP_yp, zero)));
+    inside   += Max(Pow2(Min(dP_zm, zero)), Pow2(Max(dP_zp, zero)));
+    return isOutside ? outside : inside;
+}
+
+/// @brief Compute |grad phi|^2 with HJWENO5 upwinding and Godunov's scheme for some voxels of
+/// a run read by LeafStarStencil::gatherRun().
+/// @details For each voxel this is math::ISGradientNormSqrd<math::HJWENO5_BIAS>::result() on
+/// its star: the same math::WENO5 calls on the same differences. They are laid out as arrays
+/// over the selected voxels so that the compiler can vectorize them.
+/// @tparam WholeRun  if true, evaluate all voxels of the run, in order, and ignore @a voxels
+///     and @a count. The loops then have a fixed length, which lets the compiler vectorize them.
+/// @param values  the stars of the run, as written by LeafStarStencil<GridT, 3>::gatherRun()
+/// @param voxels  the indices in the run of the voxels to evaluate
+/// @param count   the number of voxels to evaluate, at most @a Width
+/// @param normSq  the output: @c normSq[k] is the result for voxel @c voxels[k]
+template<bool WholeRun, typename T, std::size_t Width>
+inline void hjweno5NormSqGradRun(const RunStars<T, 3, Width>& values,
+                                 const std::array<int, Width>& voxels, int count,
+                                 std::array<T, Width>& normSq)
+{
+    if constexpr (WholeRun) count = int(Width);
+    // The arguments of math::WENO5 for the forward difference along axis a are stored at
+    // a * count + k, and those of the backward difference at (3 + a) * count + k.
+    std::array<T, 6 * Width> v1, v2, v3, v4, v5;
+    for (int a = 0; a < 3; ++a) {
+        for (int k = 0; k < count; ++k) {
+            const int i = WholeRun ? k : voxels[k];
+            const T m3 = values[a][0][i], m2 = values[a][1][i], m1 = values[a][2][i];
+            const T c = values[a][3][i];
+            const T p1 = values[a][4][i], p2 = values[a][5][i], p3 = values[a][6][i];
+
+            int n = a * count + k; // as in math::D1<math::FD_HJWENO5>::difference()
+            v1[n] = p3 - p2; v2[n] = p2 - p1; v3[n] = p1 - c; v4[n] = c - m1; v5[n] = m1 - m2;
+
+            n = (3 + a) * count + k; // as in math::D1<math::BD_HJWENO5>::difference(), negated
+            v1[n] = m3 - m2; v2[n] = m2 - m1; v3[n] = m1 - c; v4[n] = c - p1; v5[n] = p1 - p2;
+        }
+    }
+    std::array<T, 6 * Width> w;
+    for (int n = 0; n < 6 * count; ++n) w[n] = math::WENO5<T>(v1[n], v2[n], v3[n], v4[n], v5[n]);
+
+    for (int k = 0; k < count; ++k) {
+        const int fx = k, fy = count + k, fz = 2 * count + k;               // forward
+        const int bx = 3 * count + k, by = 4 * count + k, bz = 5 * count + k; // backward
+        const int i = WholeRun ? k : voxels[k];
+        normSq[k] = godunovsNormSqrdSelect<T>(values[0][3][i] > 0,
+            -w[bx], w[fx], -w[by], w[fy], -w[bz], w[fz]);
+    }
+}
 
 } // namespace internal
 
@@ -408,6 +552,14 @@ private:
         using MaskLeafT = typename MaskT::LeafNodeType;
         using MaskIterT = typename MaskLeafT::ValueOnCIter;
         using VoxelIterT = typename LeafType::ValueOnCIter;
+        // Use the run kernel for HJWENO5 with a LeafStarStencil, except where math:: has
+        // a SIMD version of ISGradientNormSqrd<HJWENO5_BIAS>, whose results it would not match.
+#ifdef DWA_OPENVDB
+        static constexpr bool UseRunKernel = false;
+#else
+        static constexpr bool UseRunKernel = SpatialScheme == math::HJWENO5_BIAS &&
+            std::is_same<StencilT, lstrack::internal::LeafStarStencil<GridType, 3>>::value;
+#endif
 
         Normalizer(LevelSetTracker& tracker, const MaskT* mask);
         void normalize();
@@ -421,6 +573,9 @@ private:
         inline void euler13(const LeafRange& r) {this->euler<1,3>(r, 1, 2);}
         template <int Nominator, int Denominator>
         void eval(StencilT& stencil, const ValueType* phi, ValueType* result, Index n) const;
+        template <int Nominator, int Denominator>
+        void eulerRuns(const StencilT& stencil, const LeafType& leaf,
+                       const ValueType* phi, ValueType* result) const;
         LevelSetTracker& mTracker;
         const MaskT*     mMask;
         const ValueType  mDt, mInvDx;
@@ -839,6 +994,57 @@ template<math::BiasedGradientScheme      SpatialScheme,
          typename MaskT>
 template <int Nominator, int Denominator>
 inline void
+LevelSetTracker<GridT, InterruptT>::
+Normalizer<SpatialScheme, TemporalScheme, MaskT>::
+eulerRuns(const StencilT& stencil, const LeafType& leaf,
+          const ValueType* phi, ValueType* result) const
+{
+    // The same update as eval(), for runs of consecutive voxels along z at a time.
+    static constexpr int W = lstrack::internal::RunWidth<LeafType>::value;
+    static const ValueType alpha = ValueType(Nominator)/ValueType(Denominator);
+    static const ValueType beta  = ValueType(1) - alpha;
+
+#ifdef __AVX__
+    // With vectors of 4 doubles or more, evaluating every voxel of a run is faster, because
+    // the loops have a fixed length and vectorize.
+    static constexpr bool WholeRuns = true;
+#else
+    // Otherwise, vectorizing math::WENO5 is not faster, so only active voxels are evaluated.
+    static constexpr bool WholeRuns = false;
+#endif
+
+    lstrack::internal::forEachActiveRun<W>(leaf, [&](Index n0, unsigned active) {
+        std::array<int, W> voxels;
+        int count = 0;
+        for (int i = 0; i < W; ++i) {
+            if (WholeRuns || (active & (1u << i))) voxels[count++] = i;
+        }
+        lstrack::internal::RunStars<ValueType, 3, W> values;
+        std::array<ValueType, W> normSq, v;
+        stencil.template gatherRun<W>(n0, values);
+        lstrack::internal::hjweno5NormSqGradRun<WholeRuns>(values, voxels, count, normSq);
+        for (int k = 0; k < (WholeRuns ? W : count); ++k) {
+            const ValueType phi0 = values[2][3][voxels[k]];
+            v[k] = phi0 / ( math::Sqrt(math::Pow2(phi0) + normSq[k]) +
+                            math::Tolerance<ValueType>::value() );
+            v[k] = phi0 - mDt * v[k] * (math::Sqrt(normSq[k]) * mInvDx - 1.0f);
+        }
+        for (int k = 0; k < count; ++k) {
+            if (!(active & (1u << voxels[k]))) continue;
+            const Index n = n0 + voxels[k];
+            OPENVDB_NO_UNREACHABLE_CODE_WARNING_BEGIN
+            result[n] = Nominator ? alpha * phi[n] + beta * v[k] : v[k];
+            OPENVDB_NO_UNREACHABLE_CODE_WARNING_END
+        }
+    });
+}
+
+template<typename GridT, typename InterruptT>
+template<math::BiasedGradientScheme      SpatialScheme,
+         math::TemporalIntegrationScheme TemporalScheme,
+         typename MaskT>
+template <int Nominator, int Denominator>
+inline void
 LevelSetTracker<GridT,InterruptT>::
 Normalizer<SpatialScheme, TemporalScheme, MaskT>::
 euler(const LeafRange& range, Index phiBuffer, Index resultBuffer)
@@ -852,10 +1058,14 @@ euler(const LeafRange& range, Index phiBuffer, Index resultBuffer)
         const ValueType* phi = leafIter.buffer(phiBuffer).data();
         ValueType* result = leafIter.buffer(resultBuffer).data();
         if (mMask == nullptr) {
-            for (auto iter = leafIter->cbeginValueOn(); iter; ++iter) {
-                stencil.moveTo(iter);
-                this->eval<Nominator, Denominator>(stencil, phi, result, iter.pos());
-            }//loop over active voxels in the leaf of the level set
+            if constexpr (UseRunKernel) {
+                this->template eulerRuns<Nominator, Denominator>(stencil, *leafIter, phi, result);
+            } else {
+                for (auto iter = leafIter->cbeginValueOn(); iter; ++iter) {
+                    stencil.moveTo(iter);
+                    this->eval<Nominator, Denominator>(stencil, phi, result, iter.pos());
+                }//loop over active voxels in the leaf of the level set
+            }
         } else if (const MaskLeafT* mask = mMask->probeLeaf(leafIter->origin())) {
             const ValueType* phi0 = leafIter->buffer().data();
             for (MaskIterT iter  = mask->cbeginValueOn(); iter; ++iter) {
