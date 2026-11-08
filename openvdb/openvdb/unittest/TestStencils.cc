@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <random>
@@ -202,6 +203,66 @@ void checkGather(const GridT& grid)
     EXPECT_EQ(total, Index64(0));
 }
 
+// Asserts that LeafStarStencil::gatherRun() reads, for every run of every leaf, the same values
+// as a ValueAccessor at the same coordinates. For the 19-point stencil, also asserts that the
+// HJWENO5 run kernel matches math::ISGradientNormSqrd<math::HJWENO5_BIAS> on each voxel.
+template<typename GridT, int Radius>
+void checkGatherRun(const GridT& grid)
+{
+    using StarT = lstrack::LeafStarStencil<GridT, Radius>;
+    using LeafT = typename GridT::TreeType::LeafNodeType;
+    using ValueT = typename GridT::ValueType;
+    constexpr int W = lstrack::RunWidth<LeafT>::value;
+
+    auto accessor = grid.getConstAccessor();
+    math::NineteenPointStencil<GridT> reference(grid);
+    StarT star(grid);
+    Index64 runs = 0, total = 0, kernelTotal = 0;
+    for (auto leaf = grid.tree().cbeginLeaf(); leaf; ++leaf) {
+        star.setLeaf(*leaf);
+        for (openvdb::Index n0 = 0; n0 < LeafT::SIZE; n0 += W, ++runs) {
+            lstrack::RunStars<ValueT, Radius, W> values;
+            star.template gatherRun<W>(n0, values);
+            for (int i = 0; i < W; ++i) {
+                const Coord ijk = leaf->offsetToGlobalCoord(n0 + i);
+                for (int axis = 0; axis < 3; ++axis) {
+                    for (int d = -Radius; d <= Radius; ++d) {
+                        Coord xyz = ijk;
+                        xyz[axis] += d;
+                        total += bitsDiffer(values[axis][Radius + d][i], accessor.getValue(xyz));
+                    }
+                }
+            }
+            if constexpr (Radius == 3) {
+                // The whole run, then every other voxel in reverse order.
+                std::array<std::array<int, W>, 2> voxels;
+                std::array<int, 2> counts = {{ W, 0 }};
+                for (int i = 0; i < W; ++i) voxels[0][i] = i;
+                for (int i = W - 1; i >= 0; i -= 2) voxels[1][counts[1]++] = i;
+                for (int pass = 0; pass < 2; ++pass) {
+                    std::array<ValueT, W> normSq;
+                    if (pass == 0) {
+                        lstrack::hjweno5NormSqGradRun<true>(values, voxels[0], 0, normSq);
+                    } else {
+                        lstrack::hjweno5NormSqGradRun<false>(values, voxels[1], counts[1], normSq);
+                    }
+                    for (int k = 0; k < counts[pass]; ++k) {
+                        reference.moveTo(leaf->offsetToGlobalCoord(n0 + voxels[pass][k]));
+                        const ValueT expected =
+                            math::ISGradientNormSqrd<math::HJWENO5_BIAS>::result(reference);
+                        // Not bitwise: compilers can fuse multiply-adds differently in the two.
+                        kernelTotal += std::abs(double(normSq[k]) - double(expected))
+                            > 1e-5 * (1.0 + std::abs(double(expected)));
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_GT(runs, Index64(0));
+    EXPECT_EQ(total, Index64(0));
+    EXPECT_EQ(kernelTotal, Index64(0));
+}
+
 template<typename GridT>
 void checkAllGathers()
 {
@@ -209,6 +270,9 @@ void checkAllGathers()
     checkGather<GridT, math::SevenPointStencil<GridT>, 1>(*grid);
     checkGather<GridT, math::ThirteenPointStencil<GridT>, 2>(*grid);
     checkGather<GridT, math::NineteenPointStencil<GridT>, 3>(*grid);
+    checkGatherRun<GridT, 1>(*grid);
+    checkGatherRun<GridT, 2>(*grid);
+    checkGatherRun<GridT, 3>(*grid);
 }
 
 // A sphere that is no longer a signed distance field, so the tracker has work to do.
